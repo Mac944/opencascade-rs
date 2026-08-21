@@ -890,6 +890,9 @@ pub mod ffi {
         pub fn IsDone(self: &BRepAlgoAPI_Fuse) -> bool;
         pub fn SectionEdges(self: Pin<&mut BRepAlgoAPI_Fuse>) -> &TopTools_ListOfShape;
         pub fn SetGlue(self: Pin<&mut BRepAlgoAPI_Fuse>, glue: BOPAlgo_GlueEnum);
+        pub fn Fuse_SetFuzzyValue(op: Pin<&mut BRepAlgoAPI_Fuse>, fuzz: f64);
+        pub fn Fuse_HasErrors(op: &BRepAlgoAPI_Fuse) -> bool;
+        pub fn Fuse_HasWarnings(op: &BRepAlgoAPI_Fuse) -> bool;
 
         type BRepAlgoAPI_Cut;
 
@@ -907,6 +910,9 @@ pub mod ffi {
             shape: &'a TopoDS_Shape,
         ) -> &'a TopTools_ListOfShape;
         pub fn SectionEdges(self: Pin<&mut BRepAlgoAPI_Cut>) -> &TopTools_ListOfShape;
+        pub fn Cut_SetFuzzyValue(op: Pin<&mut BRepAlgoAPI_Cut>, fuzz: f64);
+        pub fn Cut_HasErrors(op: &BRepAlgoAPI_Cut) -> bool;
+        pub fn Cut_HasWarnings(op: &BRepAlgoAPI_Cut) -> bool;
 
         type BRepAlgoAPI_Common;
 
@@ -920,6 +926,87 @@ pub mod ffi {
         pub fn Build(self: Pin<&mut BRepAlgoAPI_Common>, progress: &Message_ProgressRange);
         pub fn IsDone(self: &BRepAlgoAPI_Common) -> bool;
         pub fn SectionEdges(self: Pin<&mut BRepAlgoAPI_Common>) -> &TopTools_ListOfShape;
+        pub fn Common_SetFuzzyValue(op: Pin<&mut BRepAlgoAPI_Common>, fuzz: f64);
+        pub fn Common_HasErrors(op: &BRepAlgoAPI_Common) -> bool;
+        pub fn Common_HasWarnings(op: &BRepAlgoAPI_Common) -> bool;
+
+        // Shape validation
+        pub fn BRepCheck_IsValid(shape: &TopoDS_Shape) -> bool;
+
+        // Safe wrappers — catch C++ exceptions before FFI boundary
+        pub fn Safe_MakeThickSolidByJoin(
+            make_thick_solid: Pin<&mut BRepOffsetAPI_MakeThickSolid>,
+            shape: &TopoDS_Shape,
+            closing_faces: &TopTools_ListOfShape,
+            offset: f64,
+            tolerance: f64,
+        ) -> bool;
+        pub fn Safe_MakeThickSolidByJoinIntersection(
+            make_thick_solid: Pin<&mut BRepOffsetAPI_MakeThickSolid>,
+            shape: &TopoDS_Shape,
+            closing_faces: &TopTools_ListOfShape,
+            offset: f64,
+            tolerance: f64,
+        ) -> bool;
+        pub fn Safe_Fillet_Build(fillet: Pin<&mut BRepFilletAPI_MakeFillet>) -> bool;
+        pub fn Safe_Fillet_AddEdge(fillet: Pin<&mut BRepFilletAPI_MakeFillet>, radius: f64, edge: &TopoDS_Edge) -> bool;
+        pub fn Safe_Chamfer_Build(chamfer: Pin<&mut BRepFilletAPI_MakeChamfer>) -> bool;
+        pub fn Safe_Chamfer_AddEdge(chamfer: Pin<&mut BRepFilletAPI_MakeChamfer>, dist: f64, edge: &TopoDS_Edge) -> bool;
+        pub fn Safe_BRepCheck_IsValid(shape: &TopoDS_Shape) -> bool;
+        pub fn Safe_Clean_Shape(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
+        pub fn Safe_Clean_Shape_EdgesOnly(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
+        pub fn Safe_ThruSections_Build(loft: Pin<&mut BRepOffsetAPI_ThruSections>) -> bool;
+        pub fn Safe_MakePipe_Build(pipe: Pin<&mut BRepOffsetAPI_MakePipe>) -> bool;
+
+        // ShapeHealing — topology repair (micro-edge removal, wire gap fix, general healing)
+        pub fn Safe_ShapeHeal(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
+
+        // Parallel boolean operations — options applied BEFORE Build
+        pub fn Fuse_WithOptions(
+            shape1: &TopoDS_Shape, shape2: &TopoDS_Shape,
+            fuzzy_value: f64, is_parallel: bool,
+        ) -> UniquePtr<BRepAlgoAPI_Fuse>;
+        pub fn Cut_WithOptions(
+            shape1: &TopoDS_Shape, shape2: &TopoDS_Shape,
+            fuzzy_value: f64, is_parallel: bool,
+        ) -> UniquePtr<BRepAlgoAPI_Cut>;
+        pub fn Common_WithOptions(
+            shape1: &TopoDS_Shape, shape2: &TopoDS_Shape,
+            fuzzy_value: f64, is_parallel: bool,
+        ) -> UniquePtr<BRepAlgoAPI_Common>;
+
+        // Draft angle — applies taper to faces
+        pub fn Safe_DraftAngle(
+            shape: &TopoDS_Shape,
+            faces: &TopTools_ListOfShape,
+            dir_x: f64, dir_y: f64, dir_z: f64,
+            angle_radians: f64,
+            plane_px: f64, plane_py: f64, plane_pz: f64,
+            plane_nx: f64, plane_ny: f64, plane_nz: f64,
+        ) -> UniquePtr<TopoDS_Shape>;
+
+        // Parallel tessellation
+        pub fn BRepMesh_IncrementalMesh_ctor_parallel(
+            shape: &TopoDS_Shape, deflection: f64,
+        ) -> UniquePtr<BRepMesh_IncrementalMesh>;
+
+        // Shape copy and transformation
+        pub fn Copy_Shape(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
+        pub fn Transform_Translate(
+            shape: &TopoDS_Shape,
+            dx: f64, dy: f64, dz: f64,
+        ) -> UniquePtr<TopoDS_Shape>;
+        pub fn Transform_Rotate(
+            shape: &TopoDS_Shape,
+            ax_x: f64, ax_y: f64, ax_z: f64,
+            dir_x: f64, dir_y: f64, dir_z: f64,
+            angle_radians: f64,
+        ) -> UniquePtr<TopoDS_Shape>;
+        pub fn Transform_Mirror(
+            shape: &TopoDS_Shape,
+            pl_x: f64, pl_y: f64, pl_z: f64,
+            pn_x: f64, pn_y: f64, pn_z: f64,
+        ) -> UniquePtr<TopoDS_Shape>;
 
         type BRepAlgoAPI_Section;
 

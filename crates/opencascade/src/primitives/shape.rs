@@ -12,7 +12,7 @@ use opencascade_sys::ffi;
 use std::path::Path;
 
 pub struct Shape {
-    pub(crate) inner: UniquePtr<ffi::TopoDS_Shape>,
+    pub inner: UniquePtr<ffi::TopoDS_Shape>,
 }
 
 impl AsRef<Shape> for Shape {
@@ -274,7 +274,7 @@ impl TorusBuilder {
 }
 
 impl Shape {
-    pub(crate) fn from_shape(shape: &ffi::TopoDS_Shape) -> Self {
+    pub fn from_shape(shape: &ffi::TopoDS_Shape) -> Self {
         let inner = ffi::TopoDS_Shape_to_owned(shape);
 
         Self { inner }

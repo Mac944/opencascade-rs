@@ -1,11 +1,13 @@
 #include "rust/cxx.h"
 #include <BOPAlgo_GlueEnum.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepAlgoAPI_Section.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_GTransform.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -25,6 +27,7 @@
 #include <BRepLib.hxx>
 #include <BRepLib_ToolTriangulatedShape.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepOffsetAPI_DraftAngle.hxx>
 #include <BRepOffsetAPI_MakeOffset.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_MakePipeShell.hxx>
@@ -65,6 +68,8 @@
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
+#include <ShapeFix_Shape.hxx>
+#include <ShapeFix_Wireframe.hxx>
 #include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <Standard_Type.hxx>
 #include <StlAPI_Writer.hxx>
@@ -539,4 +544,693 @@ inline std::unique_ptr<gp_Pnt> Bnd_Box_CornerMax(const Bnd_Box &box) {
 // BRepBndLib
 inline void BRepBndLib_Add(const TopoDS_Shape &shape, Bnd_Box &box, const Standard_Boolean useTriangulation) {
   BRepBndLib::Add(shape, box, useTriangulation);
+}
+
+// BRepCheck — Shape validation
+inline bool BRepCheck_IsValid(const TopoDS_Shape &shape) {
+  BRepCheck_Analyzer analyzer(shape, Standard_True);
+  return analyzer.IsValid();
+}
+
+// Boolean fuzzy tolerance wrappers
+inline void Fuse_SetFuzzyValue(BRepAlgoAPI_Fuse &op, Standard_Real fuzz) { op.SetFuzzyValue(fuzz); }
+inline void Cut_SetFuzzyValue(BRepAlgoAPI_Cut &op, Standard_Real fuzz) { op.SetFuzzyValue(fuzz); }
+inline void Common_SetFuzzyValue(BRepAlgoAPI_Common &op, Standard_Real fuzz) { op.SetFuzzyValue(fuzz); }
+
+// Boolean error reporting wrappers
+inline bool Fuse_HasErrors(const BRepAlgoAPI_Fuse &op) { return op.HasErrors(); }
+inline bool Cut_HasErrors(const BRepAlgoAPI_Cut &op) { return op.HasErrors(); }
+inline bool Common_HasErrors(const BRepAlgoAPI_Common &op) { return op.HasErrors(); }
+inline bool Fuse_HasWarnings(const BRepAlgoAPI_Fuse &op) { return op.HasWarnings(); }
+inline bool Cut_HasWarnings(const BRepAlgoAPI_Cut &op) { return op.HasWarnings(); }
+inline bool Common_HasWarnings(const BRepAlgoAPI_Common &op) { return op.HasWarnings(); }
+
+// Safe wrappers that catch C++ exceptions before they cross the FFI boundary.
+// OCCT can throw Standard_Failure (or subclasses) from shell/fillet/chamfer operations
+// on certain geometry combinations. Without these wrappers, the exception propagates
+// through cxx → Rust → panic_cannot_unwind → process abort (STATUS_STACK_BUFFER_OVERRUN on Windows).
+
+static bool _do_thick_solid_inner(
+    BRepOffsetAPI_MakeThickSolid &make_thick_solid,
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &closing_faces,
+    Standard_Real offset,
+    Standard_Real tolerance) {
+  try {
+    make_thick_solid.MakeThickSolidByJoin(shape, closing_faces, offset, tolerance);
+    return make_thick_solid.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+#include <windows.h>
+#include <excpt.h>
+inline bool Safe_MakeThickSolidByJoin(
+    BRepOffsetAPI_MakeThickSolid &make_thick_solid,
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &closing_faces,
+    Standard_Real offset,
+    Standard_Real tolerance) {
+  __try {
+    return _do_thick_solid_inner(make_thick_solid, shape, closing_faces, offset, tolerance);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_MakeThickSolidByJoin(
+    BRepOffsetAPI_MakeThickSolid &make_thick_solid,
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &closing_faces,
+    Standard_Real offset,
+    Standard_Real tolerance) {
+  try {
+    make_thick_solid.MakeThickSolidByJoin(shape, closing_faces, offset, tolerance);
+    return make_thick_solid.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// GeomAbs_Intersection join type — sharp edges at concave junctions instead of
+// fillet-like arcs. Preferred for cylindrical holes and similar geometry where
+// the user expects crisp inner edges from the shell operation.
+static bool _do_thick_solid_intersection_inner(
+    BRepOffsetAPI_MakeThickSolid &make_thick_solid,
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &closing_faces,
+    Standard_Real offset,
+    Standard_Real tolerance) {
+  try {
+    make_thick_solid.MakeThickSolidByJoin(shape, closing_faces, offset, tolerance,
+        BRepOffset_Skin, Standard_False, Standard_False, GeomAbs_Intersection);
+    return make_thick_solid.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_MakeThickSolidByJoinIntersection(
+    BRepOffsetAPI_MakeThickSolid &make_thick_solid,
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &closing_faces,
+    Standard_Real offset,
+    Standard_Real tolerance) {
+  __try {
+    return _do_thick_solid_intersection_inner(make_thick_solid, shape, closing_faces, offset, tolerance);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_MakeThickSolidByJoinIntersection(
+    BRepOffsetAPI_MakeThickSolid &make_thick_solid,
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &closing_faces,
+    Standard_Real offset,
+    Standard_Real tolerance) {
+  try {
+    make_thick_solid.MakeThickSolidByJoin(shape, closing_faces, offset, tolerance,
+        BRepOffset_Skin, Standard_False, Standard_False, GeomAbs_Intersection);
+    return make_thick_solid.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+static bool _do_fillet_build_inner(BRepFilletAPI_MakeFillet &fillet) {
+  try {
+    Message_ProgressRange progress;
+    fillet.Build(progress);
+    return fillet.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_Fillet_Build(BRepFilletAPI_MakeFillet &fillet) {
+  __try {
+    return _do_fillet_build_inner(fillet);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_Fillet_Build(BRepFilletAPI_MakeFillet &fillet) {
+  try {
+    Message_ProgressRange progress;
+    fillet.Build(progress);
+    return fillet.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// Safe wrapper for adding an edge to a fillet builder.
+// OCCT BRepFilletAPI_MakeFillet::Add() can throw on degenerate edges from complex booleans.
+static bool _do_fillet_add_edge_inner(BRepFilletAPI_MakeFillet &fillet, Standard_Real radius, const TopoDS_Edge &edge) {
+  try {
+    fillet.Add(radius, edge);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_Fillet_AddEdge(BRepFilletAPI_MakeFillet &fillet, Standard_Real radius, const TopoDS_Edge &edge) {
+  __try {
+    return _do_fillet_add_edge_inner(fillet, radius, edge);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_Fillet_AddEdge(BRepFilletAPI_MakeFillet &fillet, Standard_Real radius, const TopoDS_Edge &edge) {
+  try {
+    fillet.Add(radius, edge);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+static bool _do_chamfer_build_inner(BRepFilletAPI_MakeChamfer &chamfer) {
+  try {
+    Message_ProgressRange progress;
+    chamfer.Build(progress);
+    return chamfer.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_Chamfer_Build(BRepFilletAPI_MakeChamfer &chamfer) {
+  __try {
+    return _do_chamfer_build_inner(chamfer);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_Chamfer_Build(BRepFilletAPI_MakeChamfer &chamfer) {
+  try {
+    Message_ProgressRange progress;
+    chamfer.Build(progress);
+    return chamfer.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// Safe wrapper for adding an edge to a chamfer builder.
+static bool _do_chamfer_add_edge_inner(BRepFilletAPI_MakeChamfer &chamfer, Standard_Real dist, const TopoDS_Edge &edge) {
+  try {
+    chamfer.Add(dist, edge);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_Chamfer_AddEdge(BRepFilletAPI_MakeChamfer &chamfer, Standard_Real dist, const TopoDS_Edge &edge) {
+  __try {
+    return _do_chamfer_add_edge_inner(chamfer, dist, edge);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_Chamfer_AddEdge(BRepFilletAPI_MakeChamfer &chamfer, Standard_Real dist, const TopoDS_Edge &edge) {
+  try {
+    chamfer.Add(dist, edge);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// Safe wrapper for BRepCheck_Analyzer (used by is_shape_valid())
+// Can throw on severely degenerate geometry from fillet/chamfer/boolean results.
+static bool _do_brep_check_inner(const TopoDS_Shape &shape) {
+  try {
+    BRepCheck_Analyzer analyzer(shape, Standard_True);
+    return analyzer.IsValid();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_BRepCheck_IsValid(const TopoDS_Shape &shape) {
+  __try {
+    return _do_brep_check_inner(shape);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_BRepCheck_IsValid(const TopoDS_Shape &shape) {
+  try {
+    BRepCheck_Analyzer analyzer(shape, Standard_True);
+    return analyzer.IsValid();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// Safe wrapper for ShapeUpgrade_UnifySameDomain::Build() (used by shape.clean())
+// Can throw on degenerate fillet/chamfer output geometry.
+// Returns nullptr on failure instead of crashing the process.
+static std::unique_ptr<TopoDS_Shape> _do_clean_shape_inner(const TopoDS_Shape &shape) {
+  try {
+    ShapeUpgrade_UnifySameDomain upgrader(shape, Standard_True, Standard_True, Standard_True);
+    upgrader.AllowInternalEdges(Standard_False);
+    upgrader.Build();
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(upgrader.Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<TopoDS_Shape> Safe_Clean_Shape(const TopoDS_Shape &shape) {
+  __try {
+    return _do_clean_shape_inner(shape);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<TopoDS_Shape> Safe_Clean_Shape(const TopoDS_Shape &shape) {
+  try {
+    ShapeUpgrade_UnifySameDomain upgrader(shape, Standard_True, Standard_True, Standard_True);
+    upgrader.AllowInternalEdges(Standard_False);
+    upgrader.Build();
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(upgrader.Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+#endif
+
+// Edges-only clean: unify edges but NOT faces. Avoids creating complex
+// face boundary wires that BRepMesh cannot tessellate (sphere+fillet+chamfer).
+static std::unique_ptr<TopoDS_Shape> _do_clean_shape_edges_only_inner(const TopoDS_Shape &shape) {
+  try {
+    ShapeUpgrade_UnifySameDomain upgrader(shape, Standard_True, Standard_False, Standard_True);
+    upgrader.AllowInternalEdges(Standard_False);
+    upgrader.Build();
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(upgrader.Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<TopoDS_Shape> Safe_Clean_Shape_EdgesOnly(const TopoDS_Shape &shape) {
+  __try {
+    return _do_clean_shape_edges_only_inner(shape);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<TopoDS_Shape> Safe_Clean_Shape_EdgesOnly(const TopoDS_Shape &shape) {
+  try {
+    ShapeUpgrade_UnifySameDomain upgrader(shape, Standard_True, Standard_False, Standard_True);
+    upgrader.AllowInternalEdges(Standard_False);
+    upgrader.Build();
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(upgrader.Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+#endif
+
+// Shape copy via BRepBuilderAPI_Copy (deep copy including geometry)
+inline std::unique_ptr<TopoDS_Shape> Copy_Shape(const TopoDS_Shape &shape) {
+  BRepBuilderAPI_Copy copier(shape, Standard_True, Standard_False);
+  return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(copier.Shape()));
+}
+
+// Translate a shape copy by (dx, dy, dz)
+inline std::unique_ptr<TopoDS_Shape> Transform_Translate(
+    const TopoDS_Shape &shape,
+    double dx, double dy, double dz) {
+  gp_Trsf trsf;
+  trsf.SetTranslation(gp_Vec(dx, dy, dz));
+  BRepBuilderAPI_Transform builder(shape, trsf, Standard_True);
+  return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(builder.Shape()));
+}
+
+// Rotate a shape copy around an axis (origin + direction) by angle_radians
+inline std::unique_ptr<TopoDS_Shape> Transform_Rotate(
+    const TopoDS_Shape &shape,
+    double ax_x, double ax_y, double ax_z,
+    double dir_x, double dir_y, double dir_z,
+    double angle_radians) {
+  gp_Ax1 axis(gp_Pnt(ax_x, ax_y, ax_z), gp_Dir(dir_x, dir_y, dir_z));
+  gp_Trsf trsf;
+  trsf.SetRotation(axis, angle_radians);
+  BRepBuilderAPI_Transform builder(shape, trsf, Standard_True);
+  return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(builder.Shape()));
+}
+
+// Mirror a shape copy across a plane (origin + normal)
+inline std::unique_ptr<TopoDS_Shape> Transform_Mirror(
+    const TopoDS_Shape &shape,
+    double pl_x, double pl_y, double pl_z,
+    double pn_x, double pn_y, double pn_z) {
+  gp_Ax2 plane(gp_Pnt(pl_x, pl_y, pl_z), gp_Dir(pn_x, pn_y, pn_z));
+  gp_Trsf trsf;
+  trsf.SetMirror(plane);
+  BRepBuilderAPI_Transform builder(shape, trsf, Standard_True);
+  return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(builder.Shape()));
+}
+
+// Safe wrapper for BRepOffsetAPI_ThruSections::Build() (used by loft)
+// Can throw on incompatible profiles or degenerate geometry.
+static bool _do_thru_sections_build_inner(BRepOffsetAPI_ThruSections &loft) {
+  try {
+    Message_ProgressRange progress;
+    loft.Build(progress);
+    return loft.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_ThruSections_Build(BRepOffsetAPI_ThruSections &loft) {
+  __try {
+    return _do_thru_sections_build_inner(loft);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_ThruSections_Build(BRepOffsetAPI_ThruSections &loft) {
+  try {
+    Message_ProgressRange progress;
+    loft.Build(progress);
+    return loft.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// Safe wrapper for BRepOffsetAPI_MakePipe::Build() (used by sweep)
+// Can throw on self-intersecting paths or incompatible profile/path.
+static bool _do_make_pipe_build_inner(BRepOffsetAPI_MakePipe &pipe) {
+  try {
+    Message_ProgressRange progress;
+    pipe.Build(progress);
+    return pipe.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+
+#ifdef _WIN32
+inline bool Safe_MakePipe_Build(BRepOffsetAPI_MakePipe &pipe) {
+  __try {
+    return _do_make_pipe_build_inner(pipe);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+#else
+inline bool Safe_MakePipe_Build(BRepOffsetAPI_MakePipe &pipe) {
+  try {
+    Message_ProgressRange progress;
+    pipe.Build(progress);
+    return pipe.IsDone();
+  } catch (...) {
+    return false;
+  }
+}
+#endif
+
+// =============================================================================
+// ShapeHealing — topology repair for downstream fillet/chamfer success
+// =============================================================================
+// Removes micro-edges, fixes wire gaps, and performs general topology repair.
+// This improves fillet/chamfer success on shapes produced by complex boolean ops.
+
+static std::unique_ptr<TopoDS_Shape> _do_shape_heal_inner(const TopoDS_Shape &shape) {
+  try {
+    // Step 1: Fix wireframe — remove small edges, fix wire gaps
+    Handle(ShapeFix_Wireframe) wirefix = new ShapeFix_Wireframe(shape);
+    wirefix->SetPrecision(1e-4);
+    wirefix->FixSmallEdges();
+    wirefix->FixWireGaps();
+    TopoDS_Shape intermediate = wirefix->Shape();
+
+    // Step 2: General shape healing
+    Handle(ShapeFix_Shape) shapefix = new ShapeFix_Shape(intermediate);
+    shapefix->Perform();
+
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(shapefix->Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<TopoDS_Shape> Safe_ShapeHeal(const TopoDS_Shape &shape) {
+  __try {
+    return _do_shape_heal_inner(shape);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<TopoDS_Shape> Safe_ShapeHeal(const TopoDS_Shape &shape) {
+  try {
+    Handle(ShapeFix_Wireframe) wirefix = new ShapeFix_Wireframe(shape);
+    wirefix->SetPrecision(1e-4);
+    wirefix->FixSmallEdges();
+    wirefix->FixWireGaps();
+    TopoDS_Shape intermediate = wirefix->Shape();
+    Handle(ShapeFix_Shape) shapefix = new ShapeFix_Shape(intermediate);
+    shapefix->Perform();
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(shapefix->Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+#endif
+
+// =============================================================================
+// Parallel boolean operations — set options BEFORE Build
+// =============================================================================
+// The 2-argument BRepAlgoAPI_Fuse/Cut/Common constructors call Build() internally,
+// so SetFuzzyValue/SetRunParallel called after construction have no effect.
+// These wrappers use the empty constructor + SetArguments/SetTools + options + Build.
+
+static std::unique_ptr<BRepAlgoAPI_Fuse> _do_fuse_with_options_inner(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  try {
+    auto fuse = std::make_unique<BRepAlgoAPI_Fuse>();
+    TopTools_ListOfShape args, tools;
+    args.Append(shape1);
+    tools.Append(shape2);
+    fuse->SetArguments(args);
+    fuse->SetTools(tools);
+    fuse->SetFuzzyValue(fuzzyValue);
+    fuse->SetRunParallel(isParallel);
+    Message_ProgressRange progress;
+    fuse->Build(progress);
+    return fuse;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<BRepAlgoAPI_Fuse> Fuse_WithOptions(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  __try {
+    return _do_fuse_with_options_inner(shape1, shape2, fuzzyValue, isParallel);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<BRepAlgoAPI_Fuse> Fuse_WithOptions(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  return _do_fuse_with_options_inner(shape1, shape2, fuzzyValue, isParallel);
+}
+#endif
+
+static std::unique_ptr<BRepAlgoAPI_Cut> _do_cut_with_options_inner(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  try {
+    auto cut = std::make_unique<BRepAlgoAPI_Cut>();
+    TopTools_ListOfShape args, tools;
+    args.Append(shape1);
+    tools.Append(shape2);
+    cut->SetArguments(args);
+    cut->SetTools(tools);
+    cut->SetFuzzyValue(fuzzyValue);
+    cut->SetRunParallel(isParallel);
+    Message_ProgressRange progress;
+    cut->Build(progress);
+    return cut;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<BRepAlgoAPI_Cut> Cut_WithOptions(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  __try {
+    return _do_cut_with_options_inner(shape1, shape2, fuzzyValue, isParallel);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<BRepAlgoAPI_Cut> Cut_WithOptions(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  return _do_cut_with_options_inner(shape1, shape2, fuzzyValue, isParallel);
+}
+#endif
+
+static std::unique_ptr<BRepAlgoAPI_Common> _do_common_with_options_inner(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  try {
+    auto common = std::make_unique<BRepAlgoAPI_Common>();
+    TopTools_ListOfShape args, tools;
+    args.Append(shape1);
+    tools.Append(shape2);
+    common->SetArguments(args);
+    common->SetTools(tools);
+    common->SetFuzzyValue(fuzzyValue);
+    common->SetRunParallel(isParallel);
+    Message_ProgressRange progress;
+    common->Build(progress);
+    return common;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<BRepAlgoAPI_Common> Common_WithOptions(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  __try {
+    return _do_common_with_options_inner(shape1, shape2, fuzzyValue, isParallel);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<BRepAlgoAPI_Common> Common_WithOptions(
+    const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
+    Standard_Real fuzzyValue, Standard_Boolean isParallel) {
+  return _do_common_with_options_inner(shape1, shape2, fuzzyValue, isParallel);
+}
+#endif
+
+// =============================================================================
+// Parallel tessellation — BRepMesh_IncrementalMesh with isInParallel flag
+// =============================================================================
+
+// =============================================================================
+// Draft angle — BRepOffsetAPI_DraftAngle with safe wrappers
+// =============================================================================
+// Applies a draft angle to specified faces. The pull direction and neutral plane
+// define how the taper is applied (e.g. Z-up pull with XY neutral plane for mold draft).
+// Returns nullptr on failure.
+
+static std::unique_ptr<TopoDS_Shape> _do_draft_angle_inner(
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &faces,
+    double dir_x, double dir_y, double dir_z,
+    double angle_radians,
+    double plane_px, double plane_py, double plane_pz,
+    double plane_nx, double plane_ny, double plane_nz) {
+  try {
+    gp_Dir direction(dir_x, dir_y, dir_z);
+    gp_Pln neutral_plane(gp_Pnt(plane_px, plane_py, plane_pz),
+                          gp_Dir(plane_nx, plane_ny, plane_nz));
+
+    BRepOffsetAPI_DraftAngle drafter(shape);
+
+    TopTools_ListIteratorOfListOfShape iter(faces);
+    for (; iter.More(); iter.Next()) {
+      const TopoDS_Face &face = TopoDS::Face(iter.Value());
+      drafter.Add(face, direction, angle_radians, neutral_plane);
+    }
+
+    Message_ProgressRange progress;
+    drafter.Build(progress);
+    if (!drafter.IsDone()) {
+      return nullptr;
+    }
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(drafter.Shape()));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#ifdef _WIN32
+inline std::unique_ptr<TopoDS_Shape> Safe_DraftAngle(
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &faces,
+    double dir_x, double dir_y, double dir_z,
+    double angle_radians,
+    double plane_px, double plane_py, double plane_pz,
+    double plane_nx, double plane_ny, double plane_nz) {
+  __try {
+    return _do_draft_angle_inner(shape, faces,
+        dir_x, dir_y, dir_z, angle_radians,
+        plane_px, plane_py, plane_pz, plane_nx, plane_ny, plane_nz);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+#else
+inline std::unique_ptr<TopoDS_Shape> Safe_DraftAngle(
+    const TopoDS_Shape &shape,
+    const TopTools_ListOfShape &faces,
+    double dir_x, double dir_y, double dir_z,
+    double angle_radians,
+    double plane_px, double plane_py, double plane_pz,
+    double plane_nx, double plane_ny, double plane_nz) {
+  return _do_draft_angle_inner(shape, faces,
+      dir_x, dir_y, dir_z, angle_radians,
+      plane_px, plane_py, plane_pz, plane_nx, plane_ny, plane_nz);
+}
+#endif
+
+inline std::unique_ptr<BRepMesh_IncrementalMesh> BRepMesh_IncrementalMesh_ctor_parallel(
+    const TopoDS_Shape &shape, Standard_Real deflection) {
+  return std::unique_ptr<BRepMesh_IncrementalMesh>(
+      new BRepMesh_IncrementalMesh(shape, deflection, Standard_False, 0.5, Standard_True));
 }

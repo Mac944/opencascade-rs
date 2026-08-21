@@ -36,7 +36,7 @@ impl From<ffi::GeomAbs_CurveType> for EdgeType {
 }
 
 pub struct Edge {
-    pub(crate) inner: UniquePtr<ffi::TopoDS_Edge>,
+    pub inner: UniquePtr<ffi::TopoDS_Edge>,
 }
 
 impl AsRef<Edge> for Edge {

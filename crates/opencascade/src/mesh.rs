@@ -20,7 +20,7 @@ pub struct Mesher {
 
 impl Mesher {
     pub fn try_new(shape: &Shape, triangulation_tolerance: f64) -> Result<Self, Error> {
-        let inner = ffi::BRepMesh_IncrementalMesh_ctor(&shape.inner, triangulation_tolerance);
+        let inner = ffi::BRepMesh_IncrementalMesh_ctor_parallel(&shape.inner, triangulation_tolerance);
 
         if inner.IsDone() {
             Ok(Self { inner })
@@ -43,8 +43,10 @@ impl Mesher {
             let triangulation_handle =
                 ffi::BRep_Tool_Triangulation(&face.inner, location.pin_mut());
 
-            let triangulation = ffi::HandlePoly_Triangulation_Get(&triangulation_handle)
-                .map_err(|_| Error::UntriangulatedFace)?;
+            let triangulation = match ffi::HandlePoly_Triangulation_Get(&triangulation_handle) {
+                Ok(t) => t,
+                Err(_) => continue, // Skip faces that failed to triangulate
+            };
 
             let index_offset = vertices.len();
             let face_point_count = triangulation.NbNodes();
