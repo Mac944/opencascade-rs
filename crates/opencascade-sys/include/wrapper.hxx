@@ -1047,7 +1047,7 @@ static std::unique_ptr<BRepAlgoAPI_Fuse> _do_fuse_with_options_inner(
     const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
     Standard_Real fuzzyValue, Standard_Boolean isParallel) {
   try {
-    auto fuse = std::make_unique<BRepAlgoAPI_Fuse>();
+    auto fuse = std::unique_ptr<BRepAlgoAPI_Fuse>(new BRepAlgoAPI_Fuse());
     TopTools_ListOfShape args, tools;
     args.Append(shape1);
     tools.Append(shape2);
@@ -1085,7 +1085,7 @@ static std::unique_ptr<BRepAlgoAPI_Cut> _do_cut_with_options_inner(
     const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
     Standard_Real fuzzyValue, Standard_Boolean isParallel) {
   try {
-    auto cut = std::make_unique<BRepAlgoAPI_Cut>();
+    auto cut = std::unique_ptr<BRepAlgoAPI_Cut>(new BRepAlgoAPI_Cut());
     TopTools_ListOfShape args, tools;
     args.Append(shape1);
     tools.Append(shape2);
@@ -1123,7 +1123,7 @@ static std::unique_ptr<BRepAlgoAPI_Common> _do_common_with_options_inner(
     const TopoDS_Shape &shape1, const TopoDS_Shape &shape2,
     Standard_Real fuzzyValue, Standard_Boolean isParallel) {
   try {
-    auto common = std::make_unique<BRepAlgoAPI_Common>();
+    auto common = std::unique_ptr<BRepAlgoAPI_Common>(new BRepAlgoAPI_Common());
     TopTools_ListOfShape args, tools;
     args.Append(shape1);
     tools.Append(shape2);
