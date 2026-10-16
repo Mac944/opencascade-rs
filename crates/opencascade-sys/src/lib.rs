@@ -67,6 +67,7 @@ pub mod ffi {
 
         // OCCT Includes
         include!("opencascade-sys/include/wrapper.hxx");
+        include!("opencascade-sys/include/paraforge_kernel.hxx");
 
         // Runtime
         type Message_ProgressRange;
@@ -957,6 +958,28 @@ pub mod ffi {
         pub fn Safe_Clean_Shape_EdgesOnly(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
         pub fn Safe_ThruSections_Build(loft: Pin<&mut BRepOffsetAPI_ThruSections>) -> bool;
         pub fn Safe_MakePipe_Build(pipe: Pin<&mut BRepOffsetAPI_MakePipe>) -> bool;
+
+        // ParaForge's guarded constructors (include/paraforge_kernel.hxx). Each builds what
+        // the named binding call builds and returns null on bad input, any throw, a failed
+        // build or an empty result.
+        // Wire::from_unordered_edges with EdgeConnection::Fuzzy { tolerance }
+        pub fn PF_MakeWire(
+            edges: &HandleTopTools_HSequenceOfShape,
+            tolerance: f64,
+        ) -> UniquePtr<TopoDS_Wire>;
+        // Wire::to_face
+        pub fn PF_MakeFace(wire: &TopoDS_Wire) -> UniquePtr<TopoDS_Face>;
+        // Face::extrude / CompoundFace::extrude, without the cast to a solid
+        pub fn PF_MakePrism(shape: &TopoDS_Shape, dx: f64, dy: f64, dz: f64) -> UniquePtr<TopoDS_Shape>;
+        // Face::revolve / CompoundFace::revolve, without the cast to a solid
+        pub fn PF_MakeRevol(
+            shape: &TopoDS_Shape,
+            origin_x: f64, origin_y: f64, origin_z: f64,
+            dir_x: f64, dir_y: f64, dir_z: f64,
+            angle_radians: f64,
+        ) -> UniquePtr<TopoDS_Shape>;
+        // Face::sweep_along, without the cast to a solid
+        pub fn PF_MakePipe(spine: &TopoDS_Wire, profile: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
 
         // ShapeHealing — topology repair (micro-edge removal, wire gap fix, general healing)
         pub fn Safe_ShapeHeal(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;

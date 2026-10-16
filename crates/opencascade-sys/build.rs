@@ -72,6 +72,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=include/wrapper.hxx");
+    println!("cargo:rerun-if-changed=include/paraforge_kernel.hxx");
 }
 
 struct OcctConfig {
