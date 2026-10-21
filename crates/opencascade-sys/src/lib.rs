@@ -980,6 +980,16 @@ pub mod ffi {
         ) -> UniquePtr<TopoDS_Shape>;
         // Face::sweep_along, without the cast to a solid
         pub fn PF_MakePipe(spine: &TopoDS_Wire, profile: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
+        // A copy of the shape meshed at a deviation (mm) and angle, within a time limit (ParaForge
+        // row PE: the export's own mesh). Null with `status` set: 1 input refused, 2 OCCT threw,
+        // 3 time limit, 4 a face failed, 5 crashed; 0 when meshed.
+        pub fn PF_MeshCopy(
+            shape: &TopoDS_Shape,
+            linear: f64,
+            angle_radians: f64,
+            time_limit_s: f64,
+            status: &mut i32,
+        ) -> UniquePtr<TopoDS_Shape>;
 
         // ShapeHealing — topology repair (micro-edge removal, wire gap fix, general healing)
         pub fn Safe_ShapeHeal(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;

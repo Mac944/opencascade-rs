@@ -20,15 +20,22 @@
 #ifndef PARAFORGE_KERNEL_HXX
 #define PARAFORGE_KERNEL_HXX
 
+#include <chrono>
 #include <cmath>
 #include <memory>
 
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRep_Tool.hxx>
+#include <IMeshData_Status.hxx>
+#include <IMeshTools_Parameters.hxx>
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressScope.hxx>
 #include <Precision.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
 #include <TopExp_Explorer.hxx>
@@ -209,6 +216,96 @@ static std::unique_ptr<TopoDS_Shape> _pf_make_pipe_inner(
   }
 }
 
+// The export's mesh (ParaForge queue row PE). The binding's BRepMesh_IncrementalMesh_ctor_parallel
+// fixes the angle at 0.5 rad and meshes the shape in place, where OCCT keeps any existing
+// triangulation finer than 1.1 times the request and never compares the angle
+// (BRepMesh_ModelPreProcessor.cxx), so an export at another quality needs its own copy:
+// BRepBuilderAPI_Copy(shape, copyGeom = true, copyMesh = false), meshed with the given deviation
+// and angle on faces and edges alike (the 5-argument constructor sets AngleInterior, which
+// B-spline faces use, to twice the angle). Edges still get half of both (BRepMesh_CurveTessellator).
+// One hang at a small angle is reported upstream (tracker 33082), so the run stops at a time
+// limit; OCCT checks it between faces and deflection passes, not while it splits an edge.
+//
+// `status` says why the result is null: 0 meshed, 1 input refused, 2 OCCT threw or the copy
+// failed, 3 stopped at the time limit, 4 some face could not be meshed (IMeshData_Failure),
+// 5 the kernel crashed (set by PF_MeshCopy before the call; the inner function never returns).
+static const int PF_MESH_OK = 0;
+static const int PF_MESH_REFUSED = 1;
+static const int PF_MESH_THREW = 2;
+static const int PF_MESH_TIME_LIMIT = 3;
+static const int PF_MESH_FACE_FAILED = 4;
+static const int PF_MESH_CRASHED = 5;
+
+class _PF_MeshDeadline : public Message_ProgressIndicator {
+public:
+  explicit _PF_MeshDeadline(Standard_Real seconds)
+      : deadline_(std::chrono::steady_clock::now() +
+                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                      std::chrono::duration<double>(seconds))) {}
+  DEFINE_STANDARD_RTTI_INLINE(_PF_MeshDeadline, Message_ProgressIndicator)
+
+protected:
+  // Called from the mesher's threads: reads the clock and a constant only.
+  virtual Standard_Boolean UserBreak() override {
+    return std::chrono::steady_clock::now() >= deadline_;
+  }
+  virtual void Show(const Message_ProgressScope &, const Standard_Boolean) override {}
+
+private:
+  const std::chrono::steady_clock::time_point deadline_;
+};
+
+static std::unique_ptr<TopoDS_Shape> _pf_mesh_copy_inner(
+    const TopoDS_Shape &shape, Standard_Real linear, Standard_Real angle_radians,
+    Standard_Real time_limit_s, int &status) {
+  try {
+    // BRepMesh_IncrementalMesh's own floors (it throws below them) and finite numbers: a NaN
+    // deviation passes OCCT's checks and can hang it (OCCT #1598). An angle past half a turn
+    // means nothing; 10 days caps the time limit so the clock arithmetic cannot overflow.
+    if (shape.IsNull() || !std::isfinite(linear) || !std::isfinite(angle_radians) ||
+        !std::isfinite(time_limit_s) || linear < Precision::Confusion() ||
+        angle_radians < Precision::Angular() || angle_radians > PF_TWO_PI / 2.0 ||
+        time_limit_s <= 0.0 || time_limit_s > 864000.0) {
+      status = PF_MESH_REFUSED;
+      return nullptr;
+    }
+    BRepBuilderAPI_Copy copier(shape, Standard_True, Standard_False);
+    if (!copier.IsDone() || copier.Shape().IsNull()) {
+      status = PF_MESH_THREW;
+      return nullptr;
+    }
+    TopoDS_Shape copy = copier.Shape();
+    IMeshTools_Parameters parameters;
+    parameters.Deflection = linear;
+    parameters.DeflectionInterior = linear;
+    parameters.Angle = angle_radians;
+    parameters.AngleInterior = angle_radians;
+    parameters.Relative = Standard_False;
+    parameters.InParallel = Standard_True;
+    Handle(_PF_MeshDeadline) deadline = new _PF_MeshDeadline(time_limit_s);
+    BRepMesh_IncrementalMesh mesher(copy, parameters, deadline->Start());
+    const Standard_Integer flags = mesher.GetStatusFlags();
+    if ((flags & IMeshData_UserBreak) != 0) {
+      status = PF_MESH_TIME_LIMIT;
+      return nullptr;
+    }
+    if (!mesher.IsDone()) {
+      status = PF_MESH_THREW;
+      return nullptr;
+    }
+    if ((flags & IMeshData_Failure) != 0) {
+      status = PF_MESH_FACE_FAILED;
+      return nullptr;
+    }
+    std::unique_ptr<TopoDS_Shape> result = _pf_shape_with_faces(copy);
+    status = result ? PF_MESH_OK : PF_MESH_THREW;
+    return result;
+  } catch (...) {
+    status = PF_MESH_THREW;
+    return nullptr;
+  }
+}
+
 // With MSVC an access violation inside the kernel is a structured exception, which only
 // __except catches; elsewhere (macOS) it cannot be caught at all, and the input checks
 // above are the only protection. MSVC refuses __try and C++ try in one function, so each
@@ -253,6 +350,15 @@ inline std::unique_ptr<TopoDS_Shape> PF_MakeRevol(
 inline std::unique_ptr<TopoDS_Shape> PF_MakePipe(
     const TopoDS_Wire &spine, const TopoDS_Shape &profile) {
   PF_GUARDED(_pf_make_pipe_inner(spine, profile))
+}
+
+// A copy of `shape` meshed at `linear` (mm, absolute) and `angle_radians`, or null with `status`
+// saying why (see _pf_mesh_copy_inner). The shape itself and its own triangulation are untouched.
+inline std::unique_ptr<TopoDS_Shape> PF_MeshCopy(
+    const TopoDS_Shape &shape, Standard_Real linear, Standard_Real angle_radians,
+    Standard_Real time_limit_s, int &status) {
+  status = PF_MESH_CRASHED;
+  PF_GUARDED(_pf_mesh_copy_inner(shape, linear, angle_radians, time_limit_s, status))
 }
 
 #undef PF_GUARDED
