@@ -990,6 +990,27 @@ pub mod ffi {
             time_limit_s: f64,
             status: &mut i32,
         ) -> UniquePtr<TopoDS_Shape>;
+        // A STEP import's read, check and repair (ParaForge row SI). `status`: 0 done, 1 input
+        // refused, 2 OCCT threw or built nothing, 3 crashed, 4 (PF_ReadStep) not readable as STEP.
+        // The shape a STEP file holds; null or empty when it holds nothing, with status 0.
+        pub fn PF_ReadStep(path: &str, status: &mut i32) -> UniquePtr<TopoDS_Shape>;
+        // The shape's faces sewn at `tolerance` (mm): BRepBuilderAPI_Sewing with its default options.
+        pub fn PF_Sew(shape: &TopoDS_Shape, tolerance: f64, status: &mut i32) -> UniquePtr<TopoDS_Shape>;
+        // Each closed shell not inside a solid made a solid (ShapeFix_Solid::SolidFromShell); the rest kept.
+        pub fn PF_SolidsFromShells(shape: &TopoDS_Shape, status: &mut i32) -> UniquePtr<TopoDS_Shape>;
+        // What the shape holds, each sub-shape once; returns the status (counts 0 unless 0).
+        pub fn PF_ShapeCounts(
+            shape: &TopoDS_Shape,
+            faces: &mut i32,
+            solids: &mut i32,
+            closed_shells: &mut i32,
+            open_shells: &mut i32,
+            loose_faces: &mut i32,
+            faces_without_surface: &mut i32,
+            open_edges: &mut i32,
+            max_edge_tolerance: &mut f64,
+            min_vertex_tolerance: &mut f64,
+        ) -> i32;
 
         // ShapeHealing — topology repair (micro-edge removal, wire gap fix, general healing)
         pub fn Safe_ShapeHeal(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;

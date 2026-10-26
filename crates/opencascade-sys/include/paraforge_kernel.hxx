@@ -23,26 +23,48 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <string>
+
+#include "rust/cxx.h"
 
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <Geom_Surface.hxx>
+#include <IFSelect_ReturnStatus.hxx>
 #include <IMeshData_Status.hxx>
 #include <IMeshTools_Parameters.hxx>
 #include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressRange.hxx>
 #include <Message_ProgressScope.hxx>
 #include <Precision.hxx>
+#include <STEPControl_Reader.hxx>
 #include <ShapeAnalysis_FreeBounds.hxx>
+#include <ShapeAnalysis_ShapeTolerance.hxx>
+#include <ShapeFix_Solid.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopLoc_Location.hxx>
 #include <TopTools_HSequenceOfShape.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
+#include <TopTools_ListIteratorOfListOfShape.hxx>
+#include <TopTools_MapIteratorOfMapOfShape.hxx>
+#include <TopTools_MapOfShape.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Compound.hxx>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <TopoDS_Wire.hxx>
 #include <gp.hxx>
 #include <gp_Ax1.hxx>
@@ -306,6 +328,207 @@ static std::unique_ptr<TopoDS_Shape> _pf_mesh_copy_inner(
   }
 }
 
+// A STEP import's read, check and repair (ParaForge queue row SI). `status` says why a result is
+// null: 0 done, 1 input refused, 2 OCCT threw or built nothing, 3 the kernel crashed (set by the
+// PF_ function before the call; the inner function never returns), 4 PF_ReadStep only: the file
+// could not be read as STEP.
+static const int PF_IMPORT_OK = 0;
+static const int PF_IMPORT_REFUSED = 1;
+static const int PF_IMPORT_THREW = 2;
+static const int PF_IMPORT_CRASHED = 3;
+static const int PF_IMPORT_UNREADABLE = 4;
+
+// Shape::read_step: STEPControl_Reader::ReadFile, TransferRoots, OneShape, with OCCT's own
+// settings (CSF_STEPDefaults unset: one ShapeFix_Shape pass inside the transfer, no sewing). A
+// file with nothing to transfer gives a null or empty shape: returned as it is, for the caller to
+// count.
+static std::unique_ptr<TopoDS_Shape> _pf_read_step_inner(rust::Str path, int &status) {
+  try {
+    const std::string file(path.data(), path.size());
+    if (file.empty()) {
+      status = PF_IMPORT_REFUSED;
+      return nullptr;
+    }
+    STEPControl_Reader reader;
+    if (reader.ReadFile(file.c_str()) != IFSelect_RetDone) {
+      status = PF_IMPORT_UNREADABLE;
+      return nullptr;
+    }
+    reader.TransferRoots(Message_ProgressRange());
+    const TopoDS_Shape shape = reader.OneShape();
+    status = PF_IMPORT_OK;
+    return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(shape));
+  } catch (...) {
+    status = PF_IMPORT_THREW;
+    return nullptr;
+  }
+}
+
+// BRepBuilderAPI_Sewing(tolerance) with its default options (sewing, analysis, cutting; no
+// non-manifold), as ParaForge-Geometry's prototype measured it (spike/importheal.py). The sewn
+// shape is a shell, or a compound of shells and faces.
+static std::unique_ptr<TopoDS_Shape> _pf_sew_inner(
+    const TopoDS_Shape &shape, Standard_Real tolerance, int &status) {
+  try {
+    if (shape.IsNull() || !std::isfinite(tolerance) || !(tolerance > 0.0) || tolerance > 10.0) {
+      status = PF_IMPORT_REFUSED;
+      return nullptr;
+    }
+    BRepBuilderAPI_Sewing sewing(tolerance);
+    sewing.Add(shape);
+    sewing.Perform();
+    std::unique_ptr<TopoDS_Shape> result = _pf_shape_with_faces(sewing.SewedShape());
+    status = result ? PF_IMPORT_OK : PF_IMPORT_THREW;
+    return result;
+  } catch (...) {
+    status = PF_IMPORT_THREW;
+    return nullptr;
+  }
+}
+
+// Every closed shell that is not already inside a solid becomes a solid
+// (ShapeFix_Solid::SolidFromShell, which also turns it outward); every solid, open shell, face
+// outside a shell and edge outside a face is kept as it is. One solid and nothing else comes back
+// as that solid, not a compound.
+static std::unique_ptr<TopoDS_Shape> _pf_solids_from_shells_inner(const TopoDS_Shape &shape, int &status) {
+  try {
+    if (shape.IsNull()) {
+      status = PF_IMPORT_REFUSED;
+      return nullptr;
+    }
+    BRep_Builder builder;
+    TopoDS_Compound compound;
+    builder.MakeCompound(compound);
+    TopTools_MapOfShape seen;
+    Standard_Integer pieces = 0;
+    TopoDS_Shape last;
+    for (TopExp_Explorer it(shape, TopAbs_SOLID); it.More(); it.Next()) {
+      if (seen.Add(it.Current())) {
+        builder.Add(compound, it.Current());
+        last = it.Current();
+        pieces++;
+      }
+    }
+    for (TopExp_Explorer it(shape, TopAbs_SHELL, TopAbs_SOLID); it.More(); it.Next()) {
+      if (!seen.Add(it.Current())) {
+        continue;
+      }
+      const TopoDS_Shell &shell = TopoDS::Shell(it.Current());
+      if (BRep_Tool::IsClosed(shell)) {
+        ShapeFix_Solid fix;
+        const TopoDS_Solid solid = fix.SolidFromShell(shell);
+        if (solid.IsNull()) {
+          status = PF_IMPORT_THREW;
+          return nullptr;
+        }
+        builder.Add(compound, solid);
+        last = solid;
+      } else {
+        builder.Add(compound, shell);
+        last = shell;
+      }
+      pieces++;
+    }
+    for (TopExp_Explorer it(shape, TopAbs_FACE, TopAbs_SHELL); it.More(); it.Next()) {
+      if (seen.Add(it.Current())) {
+        builder.Add(compound, it.Current());
+        last = it.Current();
+        pieces++;
+      }
+    }
+    for (TopExp_Explorer it(shape, TopAbs_EDGE, TopAbs_FACE); it.More(); it.Next()) {
+      if (seen.Add(it.Current())) {
+        builder.Add(compound, it.Current());
+        last = it.Current();
+        pieces++;
+      }
+    }
+    if (pieces == 1 && last.ShapeType() == TopAbs_SOLID) {
+      status = PF_IMPORT_OK;
+      return std::unique_ptr<TopoDS_Shape>(new TopoDS_Shape(last));
+    }
+    std::unique_ptr<TopoDS_Shape> result = _pf_shape_with_faces(compound);
+    status = result ? PF_IMPORT_OK : PF_IMPORT_THREW;
+    return result;
+  } catch (...) {
+    status = PF_IMPORT_THREW;
+    return nullptr;
+  }
+}
+
+// What a shape holds, for an import's report. Each sub-shape is counted once: faces; solids;
+// shells outside any solid, closed and open; faces outside any shell; faces with no surface (a
+// mesh-only STEP: triangles and nothing else); open edges (on exactly one face, not a seam, not
+// degenerated); the largest edge tolerance and the smallest vertex tolerance (0 when there are
+// none).
+static int _pf_shape_counts_inner(
+    const TopoDS_Shape &shape, int &faces, int &solids, int &closed_shells, int &open_shells,
+    int &loose_faces, int &faces_without_surface, int &open_edges,
+    Standard_Real &max_edge_tolerance, Standard_Real &min_vertex_tolerance) {
+  try {
+    faces = solids = closed_shells = open_shells = loose_faces = faces_without_surface = open_edges = 0;
+    max_edge_tolerance = min_vertex_tolerance = 0.0;
+    if (shape.IsNull()) {
+      return PF_IMPORT_OK;
+    }
+    TopTools_IndexedMapOfShape all_faces;
+    TopExp::MapShapes(shape, TopAbs_FACE, all_faces);
+    faces = all_faces.Extent();
+    for (Standard_Integer i = 1; i <= all_faces.Extent(); i++) {
+      TopLoc_Location location;
+      if (BRep_Tool::Surface(TopoDS::Face(all_faces(i)), location).IsNull()) {
+        faces_without_surface++;
+      }
+    }
+    TopTools_IndexedMapOfShape all_solids;
+    TopExp::MapShapes(shape, TopAbs_SOLID, all_solids);
+    solids = all_solids.Extent();
+    TopTools_MapOfShape seen;
+    for (TopExp_Explorer it(shape, TopAbs_SHELL, TopAbs_SOLID); it.More(); it.Next()) {
+      if (seen.Add(it.Current())) {
+        if (BRep_Tool::IsClosed(it.Current())) {
+          closed_shells++;
+        } else {
+          open_shells++;
+        }
+      }
+    }
+    for (TopExp_Explorer it(shape, TopAbs_FACE, TopAbs_SHELL); it.More(); it.Next()) {
+      if (seen.Add(it.Current())) {
+        loose_faces++;
+      }
+    }
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    for (Standard_Integer i = 1; i <= edge_faces.Extent(); i++) {
+      const TopoDS_Edge &edge = TopoDS::Edge(edge_faces.FindKey(i));
+      if (BRep_Tool::Degenerated(edge)) {
+        continue;
+      }
+      TopTools_MapOfShape on;
+      for (TopTools_ListIteratorOfListOfShape f(edge_faces.FindFromIndex(i)); f.More(); f.Next()) {
+        on.Add(f.Value());
+      }
+      if (on.Extent() == 1) {
+        TopTools_MapIteratorOfMapOfShape only(on);
+        if (!BRep_Tool::IsClosed(edge, TopoDS::Face(only.Key()))) {
+          open_edges++;
+        }
+      }
+    }
+    ShapeAnalysis_ShapeTolerance tolerance;
+    if (TopExp_Explorer(shape, TopAbs_EDGE).More()) {
+      max_edge_tolerance = tolerance.Tolerance(shape, 1, TopAbs_EDGE);
+    }
+    if (TopExp_Explorer(shape, TopAbs_VERTEX).More()) {
+      min_vertex_tolerance = tolerance.Tolerance(shape, -1, TopAbs_VERTEX);
+    }
+    return PF_IMPORT_OK;
+  } catch (...) {
+    return PF_IMPORT_THREW;
+  }
+}
+
 // With MSVC an access violation inside the kernel is a structured exception, which only
 // __except catches; elsewhere (macOS) it cannot be caught at all, and the input checks
 // above are the only protection. MSVC refuses __try and C++ try in one function, so each
@@ -359,6 +582,51 @@ inline std::unique_ptr<TopoDS_Shape> PF_MeshCopy(
     Standard_Real time_limit_s, int &status) {
   status = PF_MESH_CRASHED;
   PF_GUARDED(_pf_mesh_copy_inner(shape, linear, angle_radians, time_limit_s, status))
+}
+
+// The shape a STEP file holds (null or empty when it holds nothing), or null with `status` saying
+// why (see PF_IMPORT_OK and the rest above).
+inline std::unique_ptr<TopoDS_Shape> PF_ReadStep(rust::Str path, int &status) {
+  status = PF_IMPORT_CRASHED;
+  PF_GUARDED(_pf_read_step_inner(path, status))
+}
+
+// The shape's faces sewn at `tolerance` (mm), or null with `status`.
+inline std::unique_ptr<TopoDS_Shape> PF_Sew(const TopoDS_Shape &shape, Standard_Real tolerance, int &status) {
+  status = PF_IMPORT_CRASHED;
+  PF_GUARDED(_pf_sew_inner(shape, tolerance, status))
+}
+
+// The shape with each closed shell made a solid, or null with `status`.
+inline std::unique_ptr<TopoDS_Shape> PF_SolidsFromShells(const TopoDS_Shape &shape, int &status) {
+  status = PF_IMPORT_CRASHED;
+  PF_GUARDED(_pf_solids_from_shells_inner(shape, status))
+}
+
+// Fills the counts (see _pf_shape_counts_inner) and returns PF_IMPORT_OK, or another status with the
+// counts left at 0.
+inline int PF_ShapeCounts(
+    const TopoDS_Shape &shape, int &faces, int &solids, int &closed_shells, int &open_shells,
+    int &loose_faces, int &faces_without_surface, int &open_edges,
+    Standard_Real &max_edge_tolerance, Standard_Real &min_vertex_tolerance) {
+#ifdef _MSC_VER
+  __try {
+    return _pf_shape_counts_inner(shape, faces, solids, closed_shells, open_shells, loose_faces,
+                                  faces_without_surface, open_edges, max_edge_tolerance,
+                                  min_vertex_tolerance);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW) {
+      _resetstkoflw();
+    }
+    faces = solids = closed_shells = open_shells = loose_faces = faces_without_surface = open_edges = 0;
+    max_edge_tolerance = min_vertex_tolerance = 0.0;
+    return PF_IMPORT_CRASHED;
+  }
+#else
+  return _pf_shape_counts_inner(shape, faces, solids, closed_shells, open_shells, loose_faces,
+                                faces_without_surface, open_edges, max_edge_tolerance,
+                                min_vertex_tolerance);
+#endif
 }
 
 #undef PF_GUARDED
