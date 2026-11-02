@@ -24,21 +24,29 @@
 #include <cmath>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rust/cxx.h"
 
 #include <BOPAlgo_Alerts.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRepAlgoAPI_Defeaturing.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <GProp_GProps.hxx>
+#include <Geom2dAdaptor_Curve.hxx>
+#include <Geom2d_Curve.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <Geom_Surface.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <IMeshData_Status.hxx>
@@ -68,6 +76,14 @@
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
 #include <TopoDS_Wire.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Pnt2d.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Torus.hxx>
+#include <gp_Vec.hxx>
+#include <gp_Vec2d.hxx>
 #include <gp.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Dir.hxx>
@@ -592,6 +608,258 @@ static std::unique_ptr<TopoDS_Shape> _pf_remove_faces_inner(
   }
 }
 
+// What a face is, for finding it again after an edit (ParaForge row FS). `facts` holds 15 numbers: the
+// surface's kind (0 plane, 1 cylinder, 2 cone, 3 sphere, 4 torus, 5 anything else), a point on it
+// (plane: its origin; cone: the apex; sphere and torus: the centre; cylinder: on the axis), a direction
+// (plane: the outward normal; cylinder, cone, torus: the axis, either way round), two sizes (cylinder
+// and sphere: the radius; cone: the semi-angle; torus: both radii), the face's area, its centre of
+// area (3), the length of its edges, and which way it faces (1 away from the axis or centre, -1
+// toward it; plane 1). Returns 0, 1 on a refused input, 2 on a throw, 3 on a crash, with `facts` zero.
+static const int PF_FACTS_COUNT = 15;
+
+static int _pf_face_facts_inner(const TopoDS_Face &face, rust::Slice<double> facts) {
+  try {
+    if (face.IsNull() || facts.size() != static_cast<size_t>(PF_FACTS_COUNT)) {
+      return 1;
+    }
+    const BRepAdaptor_Surface surface(face, Standard_False);
+    const bool reversed = face.Orientation() == TopAbs_REVERSED;
+    gp_Pnt point(0.0, 0.0, 0.0);
+    gp_Dir direction(0.0, 0.0, 1.0);
+    double kind = 5.0, first = 0.0, second = 0.0;
+    bool direct = true;
+    switch (surface.GetType()) {
+      case GeomAbs_Plane: {
+        const gp_Pln plane = surface.Plane();
+        kind = 0.0;
+        point = plane.Location();
+        direction = plane.Axis().Direction();
+        direct = plane.Direct();
+        break;
+      }
+      case GeomAbs_Cylinder: {
+        const gp_Cylinder cylinder = surface.Cylinder();
+        kind = 1.0;
+        point = cylinder.Location();
+        direction = cylinder.Axis().Direction();
+        first = cylinder.Radius();
+        direct = cylinder.Direct();
+        break;
+      }
+      case GeomAbs_Cone: {
+        const gp_Cone cone = surface.Cone();
+        kind = 2.0;
+        point = cone.Apex();
+        direction = cone.Axis().Direction();
+        first = std::fabs(cone.SemiAngle());
+        direct = cone.Direct();
+        break;
+      }
+      case GeomAbs_Sphere: {
+        const gp_Sphere sphere = surface.Sphere();
+        kind = 3.0;
+        point = sphere.Location();
+        first = sphere.Radius();
+        direct = sphere.Direct();
+        break;
+      }
+      case GeomAbs_Torus: {
+        const gp_Torus torus = surface.Torus();
+        kind = 4.0;
+        point = torus.Location();
+        direction = torus.Axis().Direction();
+        first = torus.MajorRadius();
+        second = torus.MinorRadius();
+        direct = torus.Direct();
+        break;
+      }
+      default:
+        break;
+    }
+    const double faces_out = (direct != reversed) ? 1.0 : -1.0;
+    if (kind == 0.0 && faces_out < 0.0) {
+      direction.Reverse();
+    }
+    GProp_GProps area;
+    BRepGProp::SurfaceProperties(face, area);
+    GProp_GProps edges;
+    BRepGProp::LinearProperties(face, edges);
+    const gp_Pnt centre = area.CentreOfMass();
+    const double values[PF_FACTS_COUNT] = {
+        kind, point.X(), point.Y(), point.Z(), direction.X(), direction.Y(), direction.Z(), first, second,
+        area.Mass(), centre.X(), centre.Y(), centre.Z(), edges.Mass(), kind == 0.0 ? 1.0 : faces_out};
+    for (int i = 0; i < PF_FACTS_COUNT; i++) {
+      if (!std::isfinite(values[i])) {
+        return 2;
+      }
+      facts[static_cast<size_t>(i)] = values[i];
+    }
+    return 0;
+  } catch (...) {
+    return 2;
+  }
+}
+
+// How the faces of a shape meet (ParaForge row FS), read from the true surfaces at points along each
+// edge, as OCCT's mesh cannot: where a fillet meets a curved wall its triangles zigzag, and one edge
+// reads as turning both ways. `meetings` gets three numbers per edge between two faces: the two
+// faces' indexes in the order TopExp_Explorer visits them, and flags, 1 where the surface turns outward
+// (a convex edge) and 2 where it turns inward. Faces tangent along the edge read by their curvature
+// across it; 0 is a flat seam. Returns 0, 1 on a refused input, 2 on a throw, 3 on a crash.
+struct _PF_FaceSide {
+  gp_Vec normal;  // Outward.
+  gp_Vec into;    // Along the surface, away from the edge, into the face.
+  double bend;    // Curvature along `into`: above 0 the surface bends toward `normal`.
+  gp_Pnt point;
+  bool ok;
+};
+
+static _PF_FaceSide _pf_face_side(const TopoDS_Face &face, const BRepAdaptor_Surface &surface,
+                                  BRepTopAdaptor_FClass2d &classifier, const Geom2dAdaptor_Curve &curve, double at) {
+  _PF_FaceSide side;
+  side.ok = false;
+  side.bend = 0.0;
+  gp_Pnt2d uv;
+  gp_Vec2d duv;
+  curve.D1(at, uv, duv);
+  gp_Pnt point;
+  gp_Vec su, sv, suu, svv, suv;
+  surface.D2(uv.X(), uv.Y(), point, su, sv, suu, svv, suv);
+  gp_Vec cross = su.Crossed(sv);
+  if (cross.Magnitude() < 1e-12) {
+    return side;
+  }
+  const gp_Vec normal = cross.Normalized() * (face.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0);
+  const gp_Vec along = su * duv.X() + sv * duv.Y();
+  if (along.Magnitude() < 1e-12) {
+    return side;
+  }
+  gp_Vec into = normal.Crossed(along.Normalized());
+  const double e = su.Dot(su), f = su.Dot(sv), g = sv.Dot(sv);
+  const double det = e * g - f * f;
+  if (det < 1e-18) {
+    return side;
+  }
+  const double a = into.Dot(su), b = into.Dot(sv);
+  double du = (g * a - f * b) / det, dv = (e * b - f * a) / det;
+  // 0.01 mm into the face: which side of the edge is the face? (The wires' orientation would say,
+  // but a seam, a reversed face and a location all change what it means.)
+  const double step = 0.01;
+  const bool plus = classifier.Perform(gp_Pnt2d(uv.X() + step * du, uv.Y() + step * dv), Standard_True) == TopAbs_IN;
+  const bool minus = classifier.Perform(gp_Pnt2d(uv.X() - step * du, uv.Y() - step * dv), Standard_True) == TopAbs_IN;
+  if (plus == minus) {
+    return side;
+  }
+  if (minus) {
+    into.Reverse();
+    du = -du;
+    dv = -dv;
+  }
+  const gp_Vec unit = cross.Normalized();
+  const double l = suu.Dot(unit), m = suv.Dot(unit), n = svv.Dot(unit);
+  const double along_unit = l * du * du + 2.0 * m * du * dv + n * dv * dv;
+  side.bend = along_unit * (face.Orientation() == TopAbs_REVERSED ? -1.0 : 1.0);
+  side.normal = normal;
+  side.into = into;
+  side.point = point;
+  side.ok = true;
+  return side;
+}
+
+static int _pf_face_meetings_inner(const TopoDS_Shape &shape, rust::Vec<int32_t> &meetings) {
+  try {
+    if (shape.IsNull()) {
+      return 1;
+    }
+    TopTools_IndexedMapOfShape distinct;
+    std::vector<int32_t> visited;
+    for (TopExp_Explorer faces(shape, TopAbs_FACE); faces.More(); faces.Next()) {
+      const int before = distinct.Extent();
+      const int index = distinct.Add(faces.Current());
+      if (index > before) {
+        visited.push_back(static_cast<int32_t>(visited.size()));
+      } else {
+        visited.push_back(visited[static_cast<size_t>(index - 1)]);
+      }
+    }
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    std::vector<std::unique_ptr<BRepAdaptor_Surface>> surfaces(static_cast<size_t>(distinct.Extent()));
+    std::vector<std::unique_ptr<BRepTopAdaptor_FClass2d>> classifiers(static_cast<size_t>(distinct.Extent()));
+    const int samples = 5;
+    const double tangent_sine = 1e-3, no_bend = 1e-7, same_point = 1e-2;
+    for (int e = 1; e <= edge_faces.Extent(); e++) {
+      const TopoDS_Edge edge = TopoDS::Edge(edge_faces.FindKey(e));
+      if (BRep_Tool::Degenerated(edge)) {
+        continue;
+      }
+      // Each face once: a seam lists its face twice.
+      std::vector<TopoDS_Face> around;
+      for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromIndex(e)); it.More(); it.Next()) {
+        const TopoDS_Face face = TopoDS::Face(it.Value());
+        bool seen = false;
+        for (size_t k = 0; k < around.size(); k++) {
+          seen = seen || around[k].IsSame(face);
+        }
+        if (!seen) {
+          around.push_back(face);
+        }
+      }
+      if (around.size() != 2) {
+        continue;
+      }
+      double range[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+      Handle(Geom2d_Curve) on_face[2];
+      int index[2] = {0, 0};
+      bool usable = true;
+      for (int k = 0; k < 2; k++) {
+        index[k] = distinct.FindIndex(around[static_cast<size_t>(k)]);
+        const size_t slot = static_cast<size_t>(index[k] - 1);
+        const TopoDS_Face forward = TopoDS::Face(around[static_cast<size_t>(k)].Oriented(TopAbs_FORWARD));
+        if (!surfaces[slot]) {
+          surfaces[slot].reset(new BRepAdaptor_Surface(forward, Standard_False));
+          classifiers[slot].reset(new BRepTopAdaptor_FClass2d(forward, Precision::PConfusion()));
+        }
+        on_face[k] = BRep_Tool::CurveOnSurface(edge, around[static_cast<size_t>(k)], range[k][0], range[k][1]);
+        usable = usable && !on_face[k].IsNull();
+      }
+      if (!usable) {
+        continue;
+      }
+      int flags = 0;
+      for (int s = 0; s < samples; s++) {
+        const double t = (s + 0.5) / samples;
+        const Geom2dAdaptor_Curve curve_a(on_face[0], range[0][0], range[0][1]);
+        const Geom2dAdaptor_Curve curve_b(on_face[1], range[1][0], range[1][1]);
+        const size_t slot_a = static_cast<size_t>(index[0] - 1), slot_b = static_cast<size_t>(index[1] - 1);
+        const _PF_FaceSide a = _pf_face_side(around[0], *surfaces[slot_a], *classifiers[slot_a], curve_a,
+                                             range[0][0] + t * (range[0][1] - range[0][0]));
+        const _PF_FaceSide b = _pf_face_side(around[1], *surfaces[slot_b], *classifiers[slot_b], curve_b,
+                                             range[1][0] + t * (range[1][1] - range[1][0]));
+        if (!a.ok || !b.ok || a.point.Distance(b.point) > same_point) {
+          continue;
+        }
+        const double sine = a.into.Dot(b.normal);
+        if (sine < -tangent_sine) {
+          flags |= 1;
+        } else if (sine > tangent_sine) {
+          flags |= 2;
+        } else if (a.bend + b.bend < -no_bend) {
+          flags |= 1;
+        } else if (a.bend + b.bend > no_bend) {
+          flags |= 2;
+        }
+      }
+      meetings.push_back(visited[static_cast<size_t>(index[0] - 1)]);
+      meetings.push_back(visited[static_cast<size_t>(index[1] - 1)]);
+      meetings.push_back(flags);
+    }
+    return 0;
+  } catch (...) {
+    return 2;
+  }
+}
+
 // With MSVC an access violation inside the kernel is a structured exception, which only
 // __except catches; elsewhere (macOS) it cannot be caught at all, and the input checks
 // above are the only protection. MSVC refuses __try and C++ try in one function, so each
@@ -698,6 +966,38 @@ inline int PF_ShapeCounts(
   return _pf_shape_counts_inner(shape, faces, solids, closed_shells, open_shells, loose_faces,
                                 faces_without_surface, open_edges, max_edge_tolerance,
                                 min_vertex_tolerance);
+#endif
+}
+
+// See _pf_face_facts_inner.
+inline int PF_FaceFacts(const TopoDS_Face &face, rust::Slice<double> facts) {
+#ifdef _MSC_VER
+  __try {
+    return _pf_face_facts_inner(face, facts);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW) {
+      _resetstkoflw();
+    }
+    return 3;
+  }
+#else
+  return _pf_face_facts_inner(face, facts);
+#endif
+}
+
+// See _pf_face_meetings_inner.
+inline int PF_FaceMeetings(const TopoDS_Shape &shape, rust::Vec<int32_t> &meetings) {
+#ifdef _MSC_VER
+  __try {
+    return _pf_face_meetings_inner(shape, meetings);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW) {
+      _resetstkoflw();
+    }
+    return 3;
+  }
+#else
+  return _pf_face_meetings_inner(shape, meetings);
 #endif
 }
 

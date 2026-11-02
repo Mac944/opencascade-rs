@@ -1022,6 +1022,13 @@ pub mod ffi {
             status: &mut i32,
         ) -> UniquePtr<TopoDS_Shape>;
 
+        // What a face is, for finding it again after an edit (ParaForge row FS): 15 numbers, listed in
+        // paraforge_kernel.hxx. Returns 0, or 1 refused, 2 threw, 3 crashed.
+        pub fn PF_FaceFacts(face: &TopoDS_Face, facts: &mut [f64]) -> i32;
+        // How the faces of a shape meet (ParaForge row FS): three numbers per edge between two faces, listed
+        // in paraforge_kernel.hxx. Returns 0, or 1 refused, 2 threw, 3 crashed.
+        pub fn PF_FaceMeetings(shape: &TopoDS_Shape, meetings: &mut Vec<i32>) -> i32;
+
         // ShapeHealing — topology repair (micro-edge removal, wire gap fix, general healing)
         pub fn Safe_ShapeHeal(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
 
