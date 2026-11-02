@@ -27,6 +27,8 @@
 
 #include "rust/cxx.h"
 
+#include <BOPAlgo_Alerts.hxx>
+#include <BRepAlgoAPI_Defeaturing.hxx>
 #include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -529,6 +531,67 @@ static int _pf_shape_counts_inner(
   }
 }
 
+// Faces taken off a solid, the gap closed by its neighbours (ParaForge queue row FS):
+// BRepAlgoAPI_Defeaturing with its defaults, no history. It sorts the faces into connected sets
+// and removes each in turn. A set it cannot remove is only a WARNING: it reports done and hands
+// back the shape with that set still there, so any such warning is a failure here, and all the
+// faces asked for are gone or there is no result. Faces that are not on the shape are ignored by
+// OCCT; if none are, that is its error.
+//
+// `status` says why the result is null: 0 done, 1 input refused, 2 OCCT threw or reported an error,
+// 3 a set of faces could not be removed, 4 stopped at the time limit, 5 the kernel crashed (set by
+// PF_RemoveFaces before the call; the inner function never returns). OCCT checks the limit between
+// its steps, not inside an intersection, so a hang there is not stopped by it.
+static const int PF_REMOVE_OK = 0;
+static const int PF_REMOVE_REFUSED = 1;
+static const int PF_REMOVE_THREW = 2;
+static const int PF_REMOVE_UNABLE = 3;
+static const int PF_REMOVE_TIME_LIMIT = 4;
+static const int PF_REMOVE_CRASHED = 5;
+
+static std::unique_ptr<TopoDS_Shape> _pf_remove_faces_inner(
+    const TopoDS_Shape &shape, const Handle(TopTools_HSequenceOfShape) &faces,
+    Standard_Real time_limit_s, int &status) {
+  try {
+    if (shape.IsNull() || faces.IsNull() || faces->Length() < 1 || !std::isfinite(time_limit_s) ||
+        time_limit_s <= 0.0 || time_limit_s > 864000.0) {
+      status = PF_REMOVE_REFUSED;
+      return nullptr;
+    }
+    BRepAlgoAPI_Defeaturing defeaturing;
+    defeaturing.SetShape(shape);
+    for (Standard_Integer i = 1; i <= faces->Length(); i++) {
+      const TopoDS_Shape &face = faces->Value(i);
+      if (face.IsNull() || face.ShapeType() != TopAbs_FACE) {
+        status = PF_REMOVE_REFUSED;
+        return nullptr;
+      }
+      defeaturing.AddFaceToRemove(face);
+    }
+    defeaturing.SetToFillHistory(Standard_False);
+    Handle(_PF_MeshDeadline) deadline = new _PF_MeshDeadline(time_limit_s);
+    defeaturing.Build(deadline->Start());
+    if (defeaturing.HasError(STANDARD_TYPE(BOPAlgo_AlertUserBreak))) {
+      status = PF_REMOVE_TIME_LIMIT;
+      return nullptr;
+    }
+    if (defeaturing.HasErrors() || !defeaturing.IsDone()) {
+      status = PF_REMOVE_THREW;
+      return nullptr;
+    }
+    if (defeaturing.HasWarning(STANDARD_TYPE(BOPAlgo_AlertUnableToRemoveTheFeature))) {
+      status = PF_REMOVE_UNABLE;
+      return nullptr;
+    }
+    std::unique_ptr<TopoDS_Shape> result = _pf_shape_with_faces(defeaturing.Shape());
+    status = result ? PF_REMOVE_OK : PF_REMOVE_THREW;
+    return result;
+  } catch (...) {
+    status = PF_REMOVE_THREW;
+    return nullptr;
+  }
+}
+
 // With MSVC an access violation inside the kernel is a structured exception, which only
 // __except catches; elsewhere (macOS) it cannot be caught at all, and the input checks
 // above are the only protection. MSVC refuses __try and C++ try in one function, so each
@@ -601,6 +664,15 @@ inline std::unique_ptr<TopoDS_Shape> PF_Sew(const TopoDS_Shape &shape, Standard_
 inline std::unique_ptr<TopoDS_Shape> PF_SolidsFromShells(const TopoDS_Shape &shape, int &status) {
   status = PF_IMPORT_CRASHED;
   PF_GUARDED(_pf_solids_from_shells_inner(shape, status))
+}
+
+// The solid with these faces taken off and the gap closed, or null with `status` saying why (see
+// _pf_remove_faces_inner). The shape itself is untouched.
+inline std::unique_ptr<TopoDS_Shape> PF_RemoveFaces(
+    const TopoDS_Shape &shape, const Handle(TopTools_HSequenceOfShape) &faces,
+    Standard_Real time_limit_s, int &status) {
+  status = PF_REMOVE_CRASHED;
+  PF_GUARDED(_pf_remove_faces_inner(shape, faces, time_limit_s, status))
 }
 
 // Fills the counts (see _pf_shape_counts_inner) and returns PF_IMPORT_OK, or another status with the

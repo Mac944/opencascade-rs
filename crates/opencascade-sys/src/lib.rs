@@ -1011,6 +1011,16 @@ pub mod ffi {
             max_edge_tolerance: &mut f64,
             min_vertex_tolerance: &mut f64,
         ) -> i32;
+        // The solid with these faces taken off and the gap closed by its neighbours, within a time
+        // limit (ParaForge row FS: BRepAlgoAPI_Defeaturing). Null with `status` set: 1 input refused,
+        // 2 OCCT threw or reported an error, 3 a set of faces could not be removed, 4 time limit,
+        // 5 crashed; 0 when done.
+        pub fn PF_RemoveFaces(
+            shape: &TopoDS_Shape,
+            faces: &HandleTopTools_HSequenceOfShape,
+            time_limit_s: f64,
+            status: &mut i32,
+        ) -> UniquePtr<TopoDS_Shape>;
 
         // ShapeHealing — topology repair (micro-edge removal, wire gap fix, general healing)
         pub fn Safe_ShapeHeal(shape: &TopoDS_Shape) -> UniquePtr<TopoDS_Shape>;
