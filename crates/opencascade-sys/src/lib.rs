@@ -1021,6 +1021,20 @@ pub mod ffi {
             time_limit_s: f64,
             status: &mut i32,
         ) -> UniquePtr<TopoDS_Shape>;
+        // A chamfer on each edge by two distances, or with `by_angle` by a distance and an angle (in
+        // radians), `first` measured on the face given for that edge (ParaForge row BS part 2:
+        // BRepFilletAPI_MakeChamfer Add(Dis1, Dis2, E, F) / AddDA). Null with `status` set: 1 input
+        // refused, 2 an edge not on the shape or a face not on its edge, 3 OCCT threw or did not
+        // build, 4 crashed; 0 when done.
+        pub fn PF_ChamferSides(
+            shape: &TopoDS_Shape,
+            edges: &HandleTopTools_HSequenceOfShape,
+            faces: &HandleTopTools_HSequenceOfShape,
+            first: f64,
+            second: f64,
+            by_angle: bool,
+            status: &mut i32,
+        ) -> UniquePtr<TopoDS_Shape>;
 
         // What a face is, for finding it again after an edit (ParaForge row FS): 15 numbers, listed in
         // paraforge_kernel.hxx. Returns 0, or 1 refused, 2 threw, 3 crashed.

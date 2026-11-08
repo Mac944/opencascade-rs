@@ -35,6 +35,7 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
@@ -608,6 +609,84 @@ static std::unique_ptr<TopoDS_Shape> _pf_remove_faces_inner(
   }
 }
 
+// A chamfer by two distances, or by a distance and an angle, on each edge (ParaForge row BS part 2):
+// BRepFilletAPI_MakeChamfer's Add(Dis1, Dis2, E, F) or AddDA(Dis, Angle, E, F), one call per edge
+// with the face given for it, then Build. `first` is the distance measured on that face; `second` is
+// the distance on the edge's other face, or with `by_angle` the angle in radians. OCCT does nothing,
+// silently, with an edge that is not on the shape or a face that is not one of its edge's faces: both
+// are refused here (status 2). Null with `status` set: 1 input refused, 2 an edge not on the shape
+// or a face not on its edge, 3 OCCT threw or did not build, 4 crashed; 0 when done.
+static const int PF_CHAMFER_OK = 0;
+static const int PF_CHAMFER_REFUSED = 1;
+static const int PF_CHAMFER_NOT_ON_EDGE = 2;
+static const int PF_CHAMFER_FAILED = 3;
+static const int PF_CHAMFER_CRASHED = 4;
+
+static std::unique_ptr<TopoDS_Shape> _pf_chamfer_sides_inner(
+    const TopoDS_Shape &shape, const Handle(TopTools_HSequenceOfShape) &edges,
+    const Handle(TopTools_HSequenceOfShape) &faces, Standard_Real first, Standard_Real second,
+    bool by_angle, int &status) {
+  try {
+    const Standard_Real quarter_turn = PF_TWO_PI / 4.0;
+    const bool second_ok = by_angle ? (second > Precision::Angular() &&
+                                       second < quarter_turn - Precision::Angular())
+                                    : second > Precision::Confusion();
+    if (shape.IsNull() || edges.IsNull() || faces.IsNull() || edges->Length() < 1 ||
+        edges->Length() != faces->Length() || !std::isfinite(first) || !std::isfinite(second) ||
+        first <= Precision::Confusion() || !second_ok) {
+      status = PF_CHAMFER_REFUSED;
+      return nullptr;
+    }
+    TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
+    TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
+    BRepFilletAPI_MakeChamfer chamfer(shape);
+    for (Standard_Integer i = 1; i <= edges->Length(); i++) {
+      const TopoDS_Shape &edge = edges->Value(i);
+      const TopoDS_Shape &face = faces->Value(i);
+      if (edge.IsNull() || edge.ShapeType() != TopAbs_EDGE || face.IsNull() ||
+          face.ShapeType() != TopAbs_FACE) {
+        status = PF_CHAMFER_REFUSED;
+        return nullptr;
+      }
+      const Standard_Integer at = edge_faces.FindIndex(edge);
+      bool on_edge = false;
+      if (at > 0) {
+        for (TopTools_ListIteratorOfListOfShape it(edge_faces.FindFromIndex(at)); it.More();
+             it.Next()) {
+          if (it.Value().IsSame(face)) {
+            on_edge = true;
+            break;
+          }
+        }
+      }
+      if (!on_edge) {
+        status = PF_CHAMFER_NOT_ON_EDGE;
+        return nullptr;
+      }
+      if (by_angle) {
+        chamfer.AddDA(first, second, TopoDS::Edge(edge), TopoDS::Face(face));
+      } else {
+        chamfer.Add(first, second, TopoDS::Edge(edge), TopoDS::Face(face));
+      }
+    }
+    if (chamfer.NbContours() < 1) {
+      status = PF_CHAMFER_FAILED;
+      return nullptr;
+    }
+    chamfer.Build();
+    if (!chamfer.IsDone()) {
+      status = PF_CHAMFER_FAILED;
+      return nullptr;
+    }
+    std::unique_ptr<TopoDS_Shape> result = _pf_shape_with_faces(chamfer.Shape());
+    status = result ? PF_CHAMFER_OK : PF_CHAMFER_FAILED;
+    return result;
+  } catch (...) {
+    status = PF_CHAMFER_FAILED;
+    return nullptr;
+  }
+}
+
 // What a face is, for finding it again after an edit (ParaForge row FS). `facts` holds 15 numbers: the
 // surface's kind (0 plane, 1 cylinder, 2 cone, 3 sphere, 4 torus, 5 anything else), a point on it
 // (plane: its origin; cone: the apex; sphere and torus: the centre; cylinder: on the axis), a direction
@@ -941,6 +1020,14 @@ inline std::unique_ptr<TopoDS_Shape> PF_RemoveFaces(
     Standard_Real time_limit_s, int &status) {
   status = PF_REMOVE_CRASHED;
   PF_GUARDED(_pf_remove_faces_inner(shape, faces, time_limit_s, status))
+}
+
+inline std::unique_ptr<TopoDS_Shape> PF_ChamferSides(
+    const TopoDS_Shape &shape, const Handle(TopTools_HSequenceOfShape) &edges,
+    const Handle(TopTools_HSequenceOfShape) &faces, Standard_Real first, Standard_Real second,
+    bool by_angle, int &status) {
+  status = PF_CHAMFER_CRASHED;
+  PF_GUARDED(_pf_chamfer_sides_inner(shape, edges, faces, first, second, by_angle, status))
 }
 
 // Fills the counts (see _pf_shape_counts_inner) and returns PF_IMPORT_OK, or another status with the
